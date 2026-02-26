@@ -159,4 +159,99 @@ jobs:
           push: true
           # Тут вместо username должен быть ваш логин на Docker Hub
           tags: deetox/taski_gateway:latest
-  
+# Файл docker-compose.yml
+
+# Перечень volume
+volumes:
+  pg_data:
+  # Новый volume — для статических файлов
+  static:
+
+# Перечень контейнеров
+services:
+  # Имя и описание первого контейнера; имя выбирает разработчик. 
+  # Это контейнер БД
+  db:
+    # Из какого образа запустить контейнер:
+    image: postgres:13.10
+    # Файл (или список файлов) с переменными окружения
+    env_file: .env
+    # Какой volume подключить для этого контейнера
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+  # Имя и описание контейнера с бэкендом
+  backend:
+    # Из какого Dockerfile собирать образ для этого контейнера:
+    build: ./backend/
+    env_file: .env
+    # Тут подключаем volume к backend
+    volumes:
+      - static:/backend_static
+    # Какие контейнеры нужно запустить до старта этого контейнера:
+    depends_on:
+      - db
+  # Имя третьего контейнера. Это контейнер с фронтендом
+  frontend:
+    env_file: .env
+    build: ./frontend/
+    command: cp -r /app/build/. /frontend_static/
+    volumes:
+      - static:/frontend_static
+# Добавляем новый контейнер: gateway
+  gateway:
+    # Сбилдить и запустить образ, 
+    # описанный в Dockerfile в папке gateway
+    build: ./gateway/
+    # Ключ ports устанавливает
+    # перенаправление всех запросов с порта 8000 хоста
+    # на порт 80 контейнера
+    # А тут подключаем volume со статикой к gateway
+    volumes:
+      - static:/staticfiles
+    ports:
+      - 8000:80 
+    # Указываем, что контейнер gateway зависит от контейнера backend
+    # depends_on:
+    #   - backend
+  deploy:
+    runs-on: ubuntu-latest
+    needs: 
+      # Дождёмся билда всех образов Taski
+      - build_and_push_to_docker_hub
+      - build_frontend_and_push_to_docker_hub
+      - build_gateway_and_push_to_docker_hub
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+      # Копируем docker-compose.production.yml на продакшен-сервер
+      - name: Copy docker-compose.yml via ssh
+        uses: appleboy/scp-action@master
+      # Передаём параметры для action appleboy/scp-action:
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          key: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          source: "docker-compose.production.yml"
+          target: "taski"
+      - name: Executing remote ssh commands to deploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          key: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          # Параметр script передаёт в action appleboy/ssh-action команды,
+          # которые нужно выполнить на сервере, 
+          # с которым установлено соединение
+          script: |
+            cd taski
+            # Выполняет pull образов с Docker Hub
+            sudo docker compose -f docker-compose.production.yml pull
+            # Перезапускает все контейнеры в Docker Compose
+            sudo docker compose -f docker-compose.production.yml down
+            sudo docker compose -f docker-compose.production.yml up -d
+            # Выполняет миграции и сбор статики
+            sudo docker compose -f docker-compose.production.yml exec backend python manage.py migrate
+            sudo docker compose -f docker-compose.production.yml exec backend python manage.py collectstatic
+            sudo docker compose -f docker-compose.production.yml exec backend cp -r /app/collected_static/. /backend_static/static/
